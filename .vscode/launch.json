@@ -1,0 +1,26 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "preLaunchTask": "rust: cargo build",
+      "type": "probe-rs-debug",
+      "request": "launch",
+      "name": "STM32 Nucleu F429ZI",
+      "cwd": "${workspaceFolder}",
+      "connectUnderReset": false,
+      "chip": "STM32F429ZITx",
+      "flashingConfig": {
+        "flashingEnabled": true,
+        "haltAfterReset": false
+      },
+      "coreConfigs": [
+        {
+          "coreIndex": 0,
+          "programBinary": "./target/thumbv8m.main-none-eabihf/debug/${workspaceFolderBasename}",
+          "svdFile": "./stm32f429zi.svd",
+          "rttEnabled": true
+        }
+      ]
+    }
+  ]
+}

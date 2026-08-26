@@ -1,0 +1,4 @@
+[toolchain]
+channel = "stable"
+components = [ "rustfmt", "rust-analyzer", "clippy", "rust-src", "llvm-tools" ]
+targets = [ "thumbv8m.main-none-eabihf" ]

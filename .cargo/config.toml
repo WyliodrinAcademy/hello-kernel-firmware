@@ -1,0 +1,29 @@
+# This file is used for configuring Cargo's behavior for your Rust project.
+
+# This section is used for defining the configuration options for the build process.
+[build]
+# Specify the target triple we are building for
+# Cross-compiling for the Raspberry Pi Pico 2 requires the thumbv8m.main-none-eabihf triple. It tells the compiler to build code for:
+#   * the ARMv8-M Mainline (thumbv8m.main) architecture
+#   * that runs bare metal, without an operating system available (none)
+#   * uses the Embedded Application Binary Interface (eabi) with hardware floating point support (hf)
+target = "thumbv8m.main-none-eabihf"
+
+# This section is used for defining the executable that will run when we use the `cargo run` command.
+[target.'cfg(all(target_arch = "arm", target_os = "none"))']
+# Run probe-rs for flashing the executable on the board.
+runner = "probe-rs run --chip STM32U545RETxQ"
+
+# This section is used to specify environment variables that should be set when
+# running Cargo commands.
+[env]
+# This environment variable is used by the `defmt` crate to specify the level of
+# logging. This crate supports five levels of logging ranked by severity from
+# lowest to highest:
+#   * `trace`
+#   * `debug`
+#   * `info`
+#   * `warn`
+#   * `error`
+DEFMT_LOG = "info"
+

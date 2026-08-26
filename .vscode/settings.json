@@ -1,0 +1,6 @@
+{
+  "rust-analyzer.check.allTargets": false,
+  "rust-analyzer.cargo.target": "thumbv8m.main-none-eabihf",
+  "editor.formatOnSave": true,
+  "editor.formatOnSaveMode": "file"
+}
