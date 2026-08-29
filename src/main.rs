@@ -6,7 +6,10 @@ use core::convert::Infallible;
 use defmt::info;
 use defmt_rtt as _;
 use embassy_executor::{Spawner, task};
-use embassy_futures::select::{Either, select};
+use embassy_futures::{
+    join::join,
+    select::{Either, select},
+};
 use embassy_stm32::{
     Config, bind_interrupts,
     gpio::{AnyPin, Level, Output, Speed},
@@ -311,19 +314,12 @@ async fn main(spawner: Spawner) {
 
     spawner.spawn(display(latch, clock, data)).unwrap();
 
-    let sender = SEVEN_SEGMENT_CHANNEL.sender();
-
-    // for number in 0..=9999 {
-    //     sender.send(SevenSegmentCommand::Number(number, None)).await;
-    //     Timer::after_millis(100).await;
-    // }
-
-    sender
-        .send(SevenSegmentCommand::Buffer(
-            "_-.".bytes().collect(),
-            Duration::from_millis(300),
-        ))
-        .await;
+    // sender
+    //     .send(SevenSegmentCommand::Buffer(
+    //         "_-.".bytes().collect(),
+    //         Duration::from_millis(300),
+    //     ))
+    //     .await;
 
     // let receiver = channel.receiver();
 
@@ -344,64 +340,72 @@ async fn main(spawner: Spawner) {
 
     // led_1.set_low();
 
-    // let driver = Driver::new(peripherals.USB, Irqs, peripherals.PA12, peripherals.PA11);
+    let driver = Driver::new(peripherals.USB, Irqs, peripherals.PA12, peripherals.PA11);
 
-    // // Create embassy-usb Config
-    // let mut config = UsbConfig::new(0xc0de, 0xcafe);
-    // config.manufacturer = Some("Kernel Workshop");
-    // config.product = Some("Seven Segment Display");
-    // config.serial_number = Some("0xcafe_c0de");
-    // config.max_power = 100;
-    // config.max_packet_size_0 = 8;
+    // Create embassy-usb Config
+    let mut config = UsbConfig::new(0xc0de, 0xcafe);
+    config.manufacturer = Some("Kernel Workshop");
+    config.product = Some("Seven Segment Display");
+    config.serial_number = Some("0xcafe_c0de");
+    config.max_power = 100;
+    config.max_packet_size_0 = 8;
 
-    // // Create embassy-usb DeviceBuilder using the driver and config.
-    // // It needs some buffers for building the descriptors.
-    // let mut config_descriptor = [0; 256];
-    // let mut bos_descriptor = [0; 256];
-    // let mut msos_descriptor = [0; 256];
-    // let mut control_buf = [0; 64];
+    // Create embassy-usb DeviceBuilder using the driver and config.
+    // It needs some buffers for building the descriptors.
+    let mut config_descriptor = [0; 256];
+    let mut bos_descriptor = [0; 256];
+    let mut msos_descriptor = [0; 256];
+    let mut control_buf = [0; 64];
 
-    // let mut handler = ControlHandler {
-    //     if_num: InterfaceNumber(0),
-    // };
+    let mut handler = ControlHandler {
+        if_num: InterfaceNumber(0),
+    };
 
-    // let mut builder = Builder::new(
-    //     driver,
-    //     config,
-    //     &mut config_descriptor,
-    //     &mut bos_descriptor,
-    //     &mut msos_descriptor,
-    //     &mut control_buf,
-    // );
+    let mut builder = Builder::new(
+        driver,
+        config,
+        &mut config_descriptor,
+        &mut bos_descriptor,
+        &mut msos_descriptor,
+        &mut control_buf,
+    );
 
-    // // Add the Microsoft OS Descriptor (MSOS/MOD) descriptor.
-    // // We tell Windows that this entire device is compatible with the "WINUSB" feature,
-    // // which causes it to use the built-in WinUSB driver automatically, which in turn
-    // // can be used by libusb/rusb software without needing a custom driver or INF file.
-    // // In principle you might want to call msos_feature() just on a specific function,
-    // // if your device also has other functions that still use standard class drivers.
-    // builder.msos_descriptor(windows_version::WIN8_1, 0);
-    // builder.msos_feature(msos::CompatibleIdFeatureDescriptor::new("WINUSB", ""));
-    // builder.msos_feature(msos::RegistryPropertyFeatureDescriptor::new(
-    //     "DeviceInterfaceGUIDs",
-    //     msos::PropertyData::RegMultiSz(DEVICE_INTERFACE_GUIDS),
-    // ));
+    // Add the Microsoft OS Descriptor (MSOS/MOD) descriptor.
+    // We tell Windows that this entire device is compatible with the "WINUSB" feature,
+    // which causes it to use the built-in WinUSB driver automatically, which in turn
+    // can be used by libusb/rusb software without needing a custom driver or INF file.
+    // In principle you might want to call msos_feature() just on a specific function,
+    // if your device also has other functions that still use standard class drivers.
+    builder.msos_descriptor(windows_version::WIN8_1, 0);
+    builder.msos_feature(msos::CompatibleIdFeatureDescriptor::new("WINUSB", ""));
+    builder.msos_feature(msos::RegistryPropertyFeatureDescriptor::new(
+        "DeviceInterfaceGUIDs",
+        msos::PropertyData::RegMultiSz(DEVICE_INTERFACE_GUIDS),
+    ));
 
-    // // Add a vendor-specific function (class 0xFF), and corresponding interface,
-    // // that uses our custom handler.
-    // let mut function = builder.function(0xFF, 0, 0);
-    // let mut interface = function.interface();
-    // let _alternate = interface.alt_setting(0xFF, 0, 0, None);
-    // handler.if_num = interface.interface_number();
-    // drop(function);
-    // builder.handler(&mut handler);
+    // Add a vendor-specific function (class 0xFF), and corresponding interface,
+    // that uses our custom handler.
+    let mut function = builder.function(0xFF, 0, 0);
+    let mut interface = function.interface();
+    let _alternate = interface.alt_setting(0xFF, 0, 0, None);
+    handler.if_num = interface.interface_number();
+    drop(function);
+    builder.handler(&mut handler);
 
-    // // Build the builder.
-    // let mut usb = builder.build();
+    // Build the builder.
+    let mut usb = builder.build();
 
-    // // Run the USB device.
-    // usb.run().await;
-    loop {
-        Timer::after_millis(1000).await;
-    }
+    // Run the USB device.
+    join(usb.run(), async {
+        let sender = SEVEN_SEGMENT_CHANNEL.sender();
+
+        for number in 0..=9999 {
+            sender.send(SevenSegmentCommand::Number(number, None)).await;
+            Timer::after_millis(100).await;
+        }
+    })
+    .await;
+    // loop {
+    //     Timer::after_millis(1000).await;
+    // }
 }
