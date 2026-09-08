@@ -22,9 +22,7 @@ use embassy_stm32::{
     rtc::{DateTime, Rtc, RtcConfig},
     usb::{self, Driver},
 };
-use embassy_sync::{
-    blocking_mutex::raw::ThreadModeRawMutex, channel::Channel, mutex::Mutex, pubsub::PubSubChannel,
-};
+use embassy_sync::{blocking_mutex::raw::ThreadModeRawMutex, channel::Channel, watch::Watch};
 use embassy_time::{Duration, Instant, Timer};
 use embassy_usb::types::{InterfaceNumber, StringIndex};
 use embassy_usb::{
@@ -55,13 +53,17 @@ struct Status {
     minute: u8,
     day: u8,
     month: u8,
+    alarm: (u8, u8),
+    alarm_enabled: bool,
 }
+
+static STATUS: Watch<ThreadModeRawMutex, Status, 2> = Watch::new();
 
 #[derive(Copy, Clone, PartialEq, Debug)]
 enum Function {
-    Clock,
-    Date,
-    Alarm,
+    Clock = 0,
+    Date = 1,
+    Alarm = 2,
     Display,
 }
 
@@ -72,6 +74,19 @@ impl Function {
             Function::Date => Function::Alarm,
             Function::Alarm => Function::Clock,
             _ => Function::Clock,
+        }
+    }
+}
+
+impl TryFrom<u8> for Function {
+    type Error = ();
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Function::Clock),
+            1 => Ok(Function::Date),
+            2 => Ok(Function::Alarm),
+            _ => Err(()),
         }
     }
 }
@@ -109,9 +124,10 @@ struct ControlHandler {
 
 #[repr(u8)]
 enum UsbRequest {
-    SetClock = 0,
-    SetDate = 1,
-    SetAlarm = 2,
+    SetFunction = 0,
+    SetClock = 1,
+    SetDate = 2,
+    SetAlarm = 3,
     GetClock = 10,
     GetDate = 11,
     GetAlarm = 12,
@@ -126,9 +142,10 @@ impl TryFrom<u8> for UsbRequest {
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
-            0 => Ok(UsbRequest::SetClock),
-            1 => Ok(UsbRequest::SetDate),
-            2 => Ok(UsbRequest::SetAlarm),
+            0 => Ok(UsbRequest::SetFunction),
+            1 => Ok(UsbRequest::SetClock),
+            2 => Ok(UsbRequest::SetDate),
+            3 => Ok(UsbRequest::SetAlarm),
             10 => Ok(UsbRequest::GetClock),
             11 => Ok(UsbRequest::GetDate),
             12 => Ok(UsbRequest::GetAlarm),
@@ -165,6 +182,13 @@ impl Handler for ControlHandler {
 
         if let Ok(usb_request) = req.request.try_into() {
             match usb_request {
+                UsbRequest::SetFunction => {
+                    if let Ok(function) = Function::try_from(req.value as u8) {
+                        send_message(Command::SetFunction(function))
+                    } else {
+                        Some(OutResponse::Rejected)
+                    }
+                }
                 UsbRequest::SetClock => send_message(Command::SetClock(
                     (req.value >> 8) as u8,
                     (req.value & 0xff) as u8,
@@ -183,20 +207,8 @@ impl Handler for ControlHandler {
                 _ => Some(OutResponse::Rejected),
             }
         } else {
-            None
+            Some(OutResponse::Rejected)
         }
-
-        // // Ignore requests to other interfaces.
-        // if req.index != self.if_num.0 as u16 {
-        //     return None;
-        // }
-
-        // // Accept request 100, value 200, reject others.
-        // if req.request == 100 && req.value == 200 {
-        //     Some(OutResponse::Accepted)
-        // } else {
-        //     Some(OutResponse::Rejected)
-        // }
     }
 
     /// Respond to DeviceToHost control messages, where the host requests some data from us.
@@ -208,15 +220,50 @@ impl Handler for ControlHandler {
             return None;
         }
 
-        // Ignore requests to other interfaces.
-        if req.index != self.if_num.0 as u16 {
-            return None;
-        }
-
-        // Respond "hello" to request 101, value 201, when asked for 5 bytes, otherwise reject.
-        if req.request == 101 && req.value == 201 && req.length == 5 {
-            buf[..5].copy_from_slice(b"hello");
-            Some(InResponse::Accepted(&buf[..5]))
+        if let Ok(usb_request) = req.request.try_into() {
+            match usb_request {
+                UsbRequest::GetClock => {
+                    if let Some(status) = STATUS.try_get()
+                        && req.length >= 2
+                    {
+                        (&mut buf[0..2]).copy_from_slice(&[status.hour, status.minute]);
+                        Some(InResponse::Accepted(&buf[0..2]))
+                    } else {
+                        Some(InResponse::Rejected)
+                    }
+                }
+                UsbRequest::GetDate => {
+                    if let Some(status) = STATUS.try_get()
+                        && req.length >= 2
+                    {
+                        (&mut buf[0..2]).copy_from_slice(&[status.month, status.day]);
+                        Some(InResponse::Accepted(&buf[0..2]))
+                    } else {
+                        Some(InResponse::Rejected)
+                    }
+                }
+                UsbRequest::GetAlarm => {
+                    if let Some(status) = STATUS.try_get()
+                        && req.length >= 2
+                    {
+                        (&mut buf[0..2]).copy_from_slice(&[status.alarm.0, status.alarm.1]);
+                        Some(InResponse::Accepted(&buf[0..2]))
+                    } else {
+                        Some(InResponse::Rejected)
+                    }
+                }
+                UsbRequest::IsAlarmEnabled => {
+                    if let Some(status) = STATUS.try_get()
+                        && req.length >= 1
+                    {
+                        buf[0] = status.alarm_enabled as u8;
+                        Some(InResponse::Accepted(&buf[0..1]))
+                    } else {
+                        Some(InResponse::Rejected)
+                    }
+                }
+                _ => Some(InResponse::Rejected),
+            }
         } else {
             Some(InResponse::Rejected)
         }
@@ -471,7 +518,7 @@ async fn main(spawner: Spawner) {
     let mut alarm_led = Output::new(peripherals.PA7, Level::High, Speed::Low);
     let mut alarm_enabled_led = Output::new(peripherals.PC9, Level::High, Speed::Low);
 
-    // let mut beeper = Output::new(peripherals.PB3, Level::Low, Speed::Low);
+    let mut beeper = Output::new(peripherals.PB3, Level::High, Speed::Low);
 
     let fcn = ExtiInput::new(peripherals.PA1, peripherals.EXTI1, Pull::Up, Irqs);
     let hour_month = ExtiInput::new(peripherals.PA4, peripherals.EXTI4, Pull::Up, Irqs);
@@ -578,8 +625,17 @@ async fn main(spawner: Spawner) {
         // let mut alarm_hour = 0u8;
         // let mut alarm_minute = 0u8;
 
+        let read_datetime = || {
+            rtc_timeprovider
+                .now()
+                .inspect_err(|err| error!("Unable to read time from RTC: {}", err))
+                .ok()
+        };
+
         let receiver = COMMANDS_CHANNEL.receiver();
         let sender = SEVEN_SEGMENT_CHANNEL.sender();
+
+        let status = STATUS.sender();
 
         loop {
             clock_led.set_high();
@@ -591,11 +647,26 @@ async fn main(spawner: Spawner) {
                 Level::High
             });
 
+            if let Some(datetime) = read_datetime() {
+                status.send(Status {
+                    hour: datetime.hour(),
+                    minute: datetime.minute(),
+                    month: datetime.month() + 1,
+                    day: datetime.day(),
+                    alarm,
+                    alarm_enabled,
+                });
+
+                if alarm_enabled && datetime.hour() == alarm.0 && datetime.minute() == alarm.1 {
+                    alarm_enabled = false;
+                    beeper.set_low();
+                }
+            }
+
             match function {
                 Function::Clock => {
                     clock_led.set_low();
-                    let Ok(datetime) = rtc_timeprovider.now() else {
-                        error!("Failed to read time from RTC");
+                    let Some(datetime) = read_datetime() else {
                         continue;
                     };
 
@@ -612,10 +683,10 @@ async fn main(spawner: Spawner) {
                 }
                 Function::Date => {
                     date_led.set_low();
-                    let Ok(datetime) = rtc_timeprovider.now() else {
-                        error!("Failed to read time from RTC");
+                    let Some(datetime) = read_datetime() else {
                         continue;
                     };
+
                     sender
                         .send(SevenSegmentCommand::Number(
                             datetime.month() as usize * 100 + datetime.day() as usize,
@@ -637,6 +708,7 @@ async fn main(spawner: Spawner) {
 
             let command = select(receiver.receive(), Timer::after_millis(500)).await;
             if let Either::First(command) = command {
+                beeper.set_high();
                 match command {
                     Command::NextFunction => {
                         function = function.next();
@@ -644,8 +716,7 @@ async fn main(spawner: Spawner) {
 
                     Command::HourMonth => match function {
                         Function::Clock => {
-                            let Ok(datetime) = rtc_timeprovider.now() else {
-                                error!("Unable to read time from RTC");
+                            let Some(datetime) = read_datetime() else {
                                 continue;
                             };
                             let Ok(new_datetime) = DateTime::from(
@@ -657,8 +728,8 @@ async fn main(spawner: Spawner) {
                                 datetime.minute(),
                                 0,
                                 0,
-                            ) else {
-                                error!("Incorrect new time");
+                            )
+                            .inspect_err(|e| error!("Incorrect new time: {}", e)) else {
                                 continue;
                             };
                             let _ = rtc
@@ -675,8 +746,7 @@ async fn main(spawner: Spawner) {
                             alarm.0 = (alarm.0 + 1) % 24;
                         }
                         Function::Date => {
-                            let Ok(datetime) = rtc_timeprovider.now() else {
-                                error!("Unable to read time from RTC");
+                            let Some(datetime) = read_datetime() else {
                                 continue;
                             };
                             let Ok(new_datetime) = DateTime::from(
@@ -706,8 +776,7 @@ async fn main(spawner: Spawner) {
                     },
                     Command::MinuteDay => match function {
                         Function::Clock => {
-                            let Ok(datetime) = rtc_timeprovider.now() else {
-                                error!("Unable to read time from RTC");
+                            let Some(datetime) = read_datetime() else {
                                 continue;
                             };
                             let Ok(new_datetime) = DateTime::from(
@@ -737,8 +806,7 @@ async fn main(spawner: Spawner) {
                             alarm.1 = (alarm.1 + 1) % 60;
                         }
                         Function::Date => {
-                            let Ok(datetime) = rtc_timeprovider.now() else {
-                                error!("Unable to read date from RTC");
+                            let Some(datetime) = read_datetime() else {
                                 continue;
                             };
                             let Ok(new_datetime) = DateTime::from(
@@ -769,8 +837,7 @@ async fn main(spawner: Spawner) {
                     Command::SetFunction(new_function) => function = new_function,
                     Command::ToogleAlarmState => alarm_enabled = !alarm_enabled,
                     Command::SetClock(hour, minute) => {
-                        let Ok(datetime) = rtc_timeprovider.now() else {
-                            error!("Unable to read time from RTC");
+                        let Some(datetime) = read_datetime() else {
                             continue;
                         };
                         let Ok(new_datetime) = DateTime::from(
@@ -796,8 +863,7 @@ async fn main(spawner: Spawner) {
                             });
                     }
                     Command::SetDate(month, day) => {
-                        let Ok(datetime) = rtc_timeprovider.now() else {
-                            error!("Unable to read time from RTC");
+                        let Some(datetime) = read_datetime() else {
                             continue;
                         };
                         let Ok(new_datetime) = DateTime::from(
